@@ -2,6 +2,14 @@ React google picker
 ===================
 Simple react wrapper for [Google Picker API](https://developers.google.com/picker/docs/)
 
+> **Authentication update:** This component now uses [Google Identity Services](https://developers.google.com/identity/gsi/web/guides/migration)
+> for OAuth tokens. The deprecated `gapi.auth` / `gapi.auth2` flow has been replaced by
+> `google.accounts.oauth2.initTokenClient`. The component automatically loads both
+> `https://apis.google.com/js/api.js` (Picker library) and
+> `https://accounts.google.com/gsi/client` (token client). The component props are unchanged,
+> with one caveat: GIS has no true "immediate" mode, so the `authImmediate` prop is now
+> best-effort — it reuses an existing grant when possible but cannot guarantee a silent request.
+
 Installation
 ============
 ```

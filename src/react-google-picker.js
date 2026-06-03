@@ -1,14 +1,51 @@
-/* global google */
-
 import React from 'react'
 import PropTypes from 'prop-types'
 import loadScript from 'load-script'
 
+// `api.js` still provides the Picker library (`gapi.load('picker')`).
 const GOOGLE_SDK_URL = 'https://apis.google.com/js/api.js'
-const pickerNamespace = () => window.google.picker
-const googleAPI = () => window.gapi
+// Google Identity Services provides OAuth tokens (replaces the deprecated `gapi.auth`).
+const GOOGLE_GSI_URL = 'https://accounts.google.com/gsi/client'
 
-let scriptLoadingStarted = false
+const pickerNamespace = () => window.google.picker
+
+let gapiPromise = null
+let gsiPromise = null
+
+// Load an external script once, sharing the same promise across every component instance.
+const loadScriptOnce = (url, isReady) => {
+  return new Promise((resolve, reject) => {
+    if (isReady()) {
+      resolve()
+      return
+    }
+
+    loadScript(url, err => {
+      if (err) {
+        reject(err)
+      } else {
+        resolve()
+      }
+    })
+  })
+}
+
+const isGapiReady = () => !!window.gapi
+const isGsiReady = () => !!(window.google && window.google.accounts && window.google.accounts.oauth2)
+
+const loadGapi = () => {
+  if (!gapiPromise) {
+    gapiPromise = loadScriptOnce(GOOGLE_SDK_URL, isGapiReady)
+  }
+  return gapiPromise
+}
+
+const loadGsi = () => {
+  if (!gsiPromise) {
+    gsiPromise = loadScriptOnce(GOOGLE_GSI_URL, isGsiReady)
+  }
+  return gsiPromise
+}
 
 export const viewMap = {
   DOCS: 'DocsView',
@@ -67,74 +104,71 @@ export default class GoogleChooser extends React.Component {
   constructor (props) {
     super(props)
 
-    this.onApiLoad = this.onApiLoad.bind(this)
+    this.pickerApiLoaded = false
+    this.tokenClient = null
+    this.accessToken = null
+    this.tokenExpiresAt = 0
+
     this.onChoose = this.onChoose.bind(this)
     this.buildView = this.buildView.bind(this)
+    this.handleTokenResponse = this.handleTokenResponse.bind(this)
   }
 
   componentDidMount () {
-    if (this.isGoogleReady()) {
-      // google api is already exists
-      // init immediately
-      this.onApiLoad()
-    } else if (!scriptLoadingStarted) {
-      // load google api and the init
-      scriptLoadingStarted = true
-      loadScript(GOOGLE_SDK_URL, this.onApiLoad)
-    } else {
-      // is loading
-    }
+    // Load the Picker library.
+    loadGapi()
+      .then(() => new Promise(resolve => window.gapi.load('picker', resolve)))
+      .then(() => { this.pickerApiLoaded = true })
+
+    // Load Google Identity Services and create the OAuth token client.
+    loadGsi()
+      .then(() => this.initTokenClient())
   }
 
   componentWillUnmount () {
     this.disposePicker()
   }
 
-  isGoogleReady () {
-    return !!googleAPI()
+  isPickerReady () {
+    return this.pickerApiLoaded && isGapiReady()
   }
 
-  isGoogleAuthReady () {
-    return !!googleAPI().auth
-  }
-
-  isGooglePickerReady () {
-    return !!googleAPI().picker
-  }
-
-  onApiLoad () {
-    googleAPI().load('auth')
-    googleAPI().load('picker')
-  }
-
-  doAuth (callback) {
-    googleAPI().auth.authorize({
+  initTokenClient () {
+    this.tokenClient = window.google.accounts.oauth2.initTokenClient({
       client_id: this.props.clientId,
-      scope: this.props.scope,
-      immediate: this.props.authImmediate
-    },
-    callback
-    )
+      scope: this.props.scope.join(' '),
+      callback: this.handleTokenResponse,
+      error_callback: error => this.props.onAuthFailed(error)
+    })
+  }
+
+  handleTokenResponse (response) {
+    if (response && response.access_token) {
+      this.accessToken = response.access_token
+      // `expires_in` is in seconds; keep a small safety margin.
+      this.tokenExpiresAt = Date.now() + ((response.expires_in - 60) * 1000)
+      this.createPicker(this.accessToken)
+    } else {
+      this.props.onAuthFailed(response)
+    }
+  }
+
+  hasValidToken () {
+    return !!this.accessToken && Date.now() < this.tokenExpiresAt
   }
 
   onChoose () {
-    if (!this.isGoogleReady() || !this.isGoogleAuthReady() || !this.isGooglePickerReady() || this.props.disabled) {
+    if (!this.isPickerReady() || !this.tokenClient || this.props.disabled) {
       return null
     }
 
-    const token = googleAPI().auth.getToken()
-    const oauthToken = token && token.access_token
-
-    if (oauthToken) {
-      this.createPicker(oauthToken)
+    if (this.hasValidToken()) {
+      this.createPicker(this.accessToken)
     } else {
-      this.doAuth(response => {
-        if (response.access_token) {
-          this.createPicker(response.access_token)
-        } else {
-          this.props.onAuthFailed(response)
-        }
-      })
+      // `prompt: ''` reuses a prior grant when possible and only prompts when needed.
+      // GIS has no true "immediate" mode, so `authImmediate` no longer forces a silent
+      // request; an empty prompt is the closest equivalent it supports.
+      this.tokenClient.requestAccessToken({ prompt: '' })
     }
   }
 
@@ -155,7 +189,7 @@ export default class GoogleChooser extends React.Component {
     onAuthenticate(oauthToken)
 
     if (createPicker) {
-      return createPicker(google, oauthToken)
+      return createPicker(window.google, oauthToken)
     }
 
     const { viewId, mimeTypes, query } = this.props

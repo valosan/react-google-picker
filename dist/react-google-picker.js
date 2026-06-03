@@ -25,17 +25,58 @@ function _classCallCheck(instance, Constructor) { if (!(instance instanceof Cons
 
 function _possibleConstructorReturn(self, call) { if (!self) { throw new ReferenceError("this hasn't been initialised - super() hasn't been called"); } return call && (typeof call === "object" || typeof call === "function") ? call : self; }
 
-function _inherits(subClass, superClass) { if (typeof superClass !== "function" && superClass !== null) { throw new TypeError("Super expression must either be null or a function, not " + typeof superClass); } subClass.prototype = Object.create(superClass && superClass.prototype, { constructor: { value: subClass, enumerable: false, writable: true, configurable: true } }); if (superClass) Object.setPrototypeOf ? Object.setPrototypeOf(subClass, superClass) : subClass.__proto__ = superClass; } /* global google */
+function _inherits(subClass, superClass) { if (typeof superClass !== "function" && superClass !== null) { throw new TypeError("Super expression must either be null or a function, not " + typeof superClass); } subClass.prototype = Object.create(superClass && superClass.prototype, { constructor: { value: subClass, enumerable: false, writable: true, configurable: true } }); if (superClass) Object.setPrototypeOf ? Object.setPrototypeOf(subClass, superClass) : subClass.__proto__ = superClass; }
 
+// `api.js` still provides the Picker library (`gapi.load('picker')`).
 var GOOGLE_SDK_URL = 'https://apis.google.com/js/api.js';
+// Google Identity Services provides OAuth tokens (replaces the deprecated `gapi.auth`).
+var GOOGLE_GSI_URL = 'https://accounts.google.com/gsi/client';
+
 var pickerNamespace = function pickerNamespace() {
   return window.google.picker;
 };
-var googleAPI = function googleAPI() {
-  return window.gapi;
+
+var gapiPromise = null;
+var gsiPromise = null;
+
+// Load an external script once, sharing the same promise across every component instance.
+var loadScriptOnce = function loadScriptOnce(url, isReady) {
+  return new Promise(function (resolve, reject) {
+    if (isReady()) {
+      resolve();
+      return;
+    }
+
+    (0, _loadScript2.default)(url, function (err) {
+      if (err) {
+        reject(err);
+      } else {
+        resolve();
+      }
+    });
+  });
 };
 
-var scriptLoadingStarted = false;
+var isGapiReady = function isGapiReady() {
+  return !!window.gapi;
+};
+var isGsiReady = function isGsiReady() {
+  return !!(window.google && window.google.accounts && window.google.accounts.oauth2);
+};
+
+var loadGapi = function loadGapi() {
+  if (!gapiPromise) {
+    gapiPromise = loadScriptOnce(GOOGLE_SDK_URL, isGapiReady);
+  }
+  return gapiPromise;
+};
+
+var loadGsi = function loadGsi() {
+  if (!gsiPromise) {
+    gsiPromise = loadScriptOnce(GOOGLE_GSI_URL, isGsiReady);
+  }
+  return gsiPromise;
+};
 
 var viewMap = exports.viewMap = {
   DOCS: 'DocsView',
@@ -66,26 +107,35 @@ var GoogleChooser = function (_React$Component) {
 
     var _this = _possibleConstructorReturn(this, (GoogleChooser.__proto__ || Object.getPrototypeOf(GoogleChooser)).call(this, props));
 
-    _this.onApiLoad = _this.onApiLoad.bind(_this);
+    _this.pickerApiLoaded = false;
+    _this.tokenClient = null;
+    _this.accessToken = null;
+    _this.tokenExpiresAt = 0;
+
     _this.onChoose = _this.onChoose.bind(_this);
     _this.buildView = _this.buildView.bind(_this);
+    _this.handleTokenResponse = _this.handleTokenResponse.bind(_this);
     return _this;
   }
 
   _createClass(GoogleChooser, [{
     key: 'componentDidMount',
     value: function componentDidMount() {
-      if (this.isGoogleReady()) {
-        // google api is already exists
-        // init immediately
-        this.onApiLoad();
-      } else if (!scriptLoadingStarted) {
-        // load google api and the init
-        scriptLoadingStarted = true;
-        (0, _loadScript2.default)(GOOGLE_SDK_URL, this.onApiLoad);
-      } else {
-        // is loading
-      }
+      var _this2 = this;
+
+      // Load the Picker library.
+      loadGapi().then(function () {
+        return new Promise(function (resolve) {
+          return window.gapi.load('picker', resolve);
+        });
+      }).then(function () {
+        _this2.pickerApiLoaded = true;
+      });
+
+      // Load Google Identity Services and create the OAuth token client.
+      loadGsi().then(function () {
+        return _this2.initTokenClient();
+      });
     }
   }, {
     key: 'componentWillUnmount',
@@ -93,57 +143,55 @@ var GoogleChooser = function (_React$Component) {
       this.disposePicker();
     }
   }, {
-    key: 'isGoogleReady',
-    value: function isGoogleReady() {
-      return !!googleAPI();
+    key: 'isPickerReady',
+    value: function isPickerReady() {
+      return this.pickerApiLoaded && isGapiReady();
     }
   }, {
-    key: 'isGoogleAuthReady',
-    value: function isGoogleAuthReady() {
-      return !!googleAPI().auth;
-    }
-  }, {
-    key: 'isGooglePickerReady',
-    value: function isGooglePickerReady() {
-      return !!googleAPI().picker;
-    }
-  }, {
-    key: 'onApiLoad',
-    value: function onApiLoad() {
-      googleAPI().load('auth');
-      googleAPI().load('picker');
-    }
-  }, {
-    key: 'doAuth',
-    value: function doAuth(callback) {
-      googleAPI().auth.authorize({
+    key: 'initTokenClient',
+    value: function initTokenClient() {
+      var _this3 = this;
+
+      this.tokenClient = window.google.accounts.oauth2.initTokenClient({
         client_id: this.props.clientId,
-        scope: this.props.scope,
-        immediate: this.props.authImmediate
-      }, callback);
+        scope: this.props.scope.join(' '),
+        callback: this.handleTokenResponse,
+        error_callback: function error_callback(error) {
+          return _this3.props.onAuthFailed(error);
+        }
+      });
+    }
+  }, {
+    key: 'handleTokenResponse',
+    value: function handleTokenResponse(response) {
+      if (response && response.access_token) {
+        this.accessToken = response.access_token;
+        // `expires_in` is in seconds; keep a small safety margin.
+        this.tokenExpiresAt = Date.now() + (response.expires_in - 60) * 1000;
+        this.createPicker(this.accessToken);
+      } else {
+        this.props.onAuthFailed(response);
+      }
+    }
+  }, {
+    key: 'hasValidToken',
+    value: function hasValidToken() {
+      return !!this.accessToken && Date.now() < this.tokenExpiresAt;
     }
   }, {
     key: 'onChoose',
     value: function onChoose() {
-      var _this2 = this;
-
-      if (!this.isGoogleReady() || !this.isGoogleAuthReady() || !this.isGooglePickerReady() || this.props.disabled) {
+      if (!this.isPickerReady() || !this.tokenClient || this.props.disabled) {
         return null;
       }
 
-      var token = googleAPI().auth.getToken();
-      var oauthToken = token && token.access_token;
-
-      if (oauthToken) {
-        this.createPicker(oauthToken);
+      if (this.hasValidToken()) {
+        this.createPicker(this.accessToken);
       } else {
-        this.doAuth(function (response) {
-          if (response.access_token) {
-            _this2.createPicker(response.access_token);
-          } else {
-            _this2.props.onAuthFailed(response);
-          }
-        });
+        // `prompt: ''` reuses a prior grant when possible and only prompts when needed.
+        // GIS has no true "immediate" mode, so `authImmediate` no longer forces a silent
+        // request; an empty prompt is the closest equivalent it supports.
+        this.tokenClient.requestAccessToken({ prompt: '' });
       }
     }
   }, {
@@ -167,7 +215,7 @@ var GoogleChooser = function (_React$Component) {
       onAuthenticate(oauthToken);
 
       if (createPicker) {
-        return createPicker(google, oauthToken);
+        return createPicker(window.google, oauthToken);
       }
 
       var _props2 = this.props,
